@@ -1,3 +1,4 @@
+setuptools
 dash
 dash-bootstrap-components
 plotly
