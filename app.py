@@ -1,5 +1,5 @@
 import dash
-from dash import dcc, html, Input, Output, callback
+from dash import dcc, html, Input, Output
 import dash_bootstrap_components as dbc
 import pandas as pd
 import plotly.express as px
@@ -10,702 +10,525 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
-# DATA LOADING
+# DATA LOADING — minimal columns only
 # ==============================================================================
 
-flights  = pd.read_csv("https://raw.githubusercontent.com/byuidatascience/data4python4ds/master/data-raw/flights/flights.csv")
-airlines = pd.read_csv("https://raw.githubusercontent.com/byuidatascience/data4python4ds/master/data-raw/airlines/airlines.csv")
-planes   = pd.read_csv("https://raw.githubusercontent.com/byuidatascience/data4python4ds/master/data-raw/planes/planes.csv")
-weather  = pd.read_csv("https://raw.githubusercontent.com/byuidatascience/data4python4ds/master/data-raw/weather/weather.csv")
+FLIGHT_COLS = ['year','month','day','hour','dep_time','dep_delay','arr_delay',
+               'carrier','tailnum','origin','dest','air_time','distance','flight']
+
+flights = pd.read_csv(
+    "https://raw.githubusercontent.com/byuidatascience/data4python4ds/master/data-raw/flights/flights.csv",
+    usecols=FLIGHT_COLS)
+
+airlines = pd.read_csv(
+    "https://raw.githubusercontent.com/byuidatascience/data4python4ds/master/data-raw/airlines/airlines.csv")
+
+planes = pd.read_csv(
+    "https://raw.githubusercontent.com/byuidatascience/data4python4ds/master/data-raw/planes/planes.csv",
+    usecols=['tailnum','year','manufacturer'])
+
+weather = pd.read_csv(
+    "https://raw.githubusercontent.com/byuidatascience/data4python4ds/master/data-raw/weather/weather.csv",
+    usecols=['year','month','day','hour','origin','temp','precip','visib','wind_speed'])
 
 # ==============================================================================
-# DATA PREPARATION (same logic as notebook)
+# PRE-COMPUTE ALL SUMMARIES (free raw joins after)
 # ==============================================================================
 
-# Cancelled flag
+MONTH_MAP = {1:'Jan',2:'Feb',3:'Mar',4:'Apr',5:'May',6:'Jun',
+             7:'Jul',8:'Aug',9:'Sep',10:'Oct',11:'Nov',12:'Dec'}
+
 flights['is_cancelled'] = flights['dep_time'].isna()
 flights['cancelled']    = flights['is_cancelled'].astype(int)
+flights['time_of_day']  = pd.cut(flights['hour'], bins=[-1,5,11,17,23],
+                                  labels=['Night','Morning','Afternoon','Evening'])
 
-# Time of day
-flights['time_of_day'] = pd.cut(
-    flights['hour'],
-    bins=[-1, 5, 11, 17, 23],
-    labels=['Night', 'Morning', 'Afternoon', 'Evening']
+# Cancellations by month
+cancel_month = (
+    flights.groupby('month')
+    .agg(total=('cancelled','count'), cancelled=('cancelled','sum'))
+    .assign(pct=lambda x: x['cancelled']/x['total']*100)
+    .reset_index()
 )
+cancel_month['month_name'] = cancel_month['month'].map(MONTH_MAP)
 
-# Delay recovered
-valid = flights.dropna(subset=['dep_delay', 'arr_delay', 'air_time']).copy()
-valid['delay_recovered'] = valid['dep_delay'] - valid['arr_delay']
-valid['duration_category'] = pd.cut(
-    valid['air_time'],
-    bins=[0, 60, 120, 180, 360],
-    labels=['Very Short (<1hr)', 'Short (1-2hr)', 'Medium (2-3hr)', 'Long (3hr+)']
+# SFO cancellations
+sfo_cancel = (
+    flights[flights['dest']=='SFO']
+    .assign(is_canc=lambda x: x['dep_time'].isna())
+    .groupby(['month','carrier'])
+    .agg(total=('is_canc','count'), cancelled=('is_canc','sum'))
+    .assign(pct=lambda x: x['cancelled']/x['total']*100)
+    .reset_index()
+    .merge(airlines, on='carrier', how='left')
 )
+sfo_cancel['month_name'] = sfo_cancel['month'].map(MONTH_MAP)
 
-# Plane age
-flights_planes = flights.merge(
-    planes[['tailnum', 'year']].rename(columns={'year': 'year_manufactured'}),
-    on='tailnum', how='left'
-)
-flights_planes['plane_age'] = 2013 - flights_planes['year_manufactured']
-flights_planes_clean = flights_planes[
-    (flights_planes['plane_age'] >= 0) &
-    (flights_planes['plane_age'] <= 50) &
-    flights_planes['plane_age'].notna()
-].copy()
-flights_planes_clean['age_group'] = pd.cut(
-    flights_planes_clean['plane_age'],
-    bins=[0, 5, 10, 15, 20, 50],
-    labels=['0-5 yrs', '5-10 yrs', '10-15 yrs', '15-20 yrs', '20+ yrs']
-)
-
-# Manufacturer cleanup
-planes['manufacturer'] = planes['manufacturer'].str.upper().str.strip()
-conditions = [
-    planes['manufacturer'].str.contains('AIRBUS', na=False),
-    planes['manufacturer'].str.contains('BOEING', na=False),
-    planes['manufacturer'].str.contains('MCDONNELL|DOUGLAS', na=False, regex=True),
-    planes['manufacturer'].str.contains('BOMBARDIER|CANADAIR', na=False, regex=True),
-    planes['manufacturer'].str.contains('EMBRAER', na=False),
-]
-choices = ['AIRBUS', 'BOEING', 'MCDONNELL DOUGLAS', 'BOMBARDIER', 'EMBRAER']
-planes['manufacturer_clean'] = np.select(conditions, choices, default=planes['manufacturer'])
-
-# Weather join
-flights_weather = flights.merge(
-    weather, on=['year', 'month', 'day', 'hour', 'origin'], how='left'
-)
-flights_weather['has_precip'] = flights_weather['precip'] > 0
-flights_weather['visibility_category'] = pd.cut(
-    flights_weather['visib'],
-    bins=[0, 2, 5, 10, float('inf')],
-    labels=['Poor (0-2)', 'Fair (2-5)', 'Good (5-10)', 'Excellent (10+)'],
-    include_lowest=True
+# Carrier delay ranking
+carrier_delays = (
+    flights.merge(airlines, on='carrier', how='left')
+    .dropna(subset=['arr_delay','dep_delay'])
+    .groupby('name')
+    .agg(arr_delay=('arr_delay','mean'), dep_delay=('dep_delay','mean'), n=('arr_delay','count'))
+    .reset_index()
+    .sort_values('arr_delay')
 )
 
 # Route difficulty
 route_delays = (
     flights.dropna(subset=['arr_delay'])
-    .groupby(['origin', 'dest'])
-    .agg(avg_delay=('arr_delay', 'mean'), avg_distance=('distance', 'mean'), num_flights=('arr_delay', 'count'))
+    .groupby(['origin','dest'])
+    .agg(avg_delay=('arr_delay','mean'), avg_distance=('distance','mean'), num_flights=('arr_delay','count'))
+    .reset_index()
+    .query('num_flights > 50')
+)
+
+carrier_route = (
+    flights.merge(route_delays[['origin','dest','avg_delay','avg_distance']], on=['origin','dest'], how='left')
+    .merge(airlines, on='carrier')
+    .groupby('name')
+    .agg(route_avg_delay=('avg_delay','mean'), avg_distance=('avg_distance','mean'), num_flights=('avg_delay','count'))
     .reset_index()
 )
-route_delays = route_delays[route_delays['num_flights'] > 50]
 
-# Flights with names
-flights_named = flights.merge(airlines, on='carrier', how='left')
+# Weather summaries
+fw = flights[['year','month','day','hour','origin','dep_delay','arr_delay']].merge(
+    weather, on=['year','month','day','hour','origin'], how='left')
 
-# Airport performance
-airport_performance = (
+weather_precip = (
+    fw.assign(has_precip=fw['precip']>0)
+    .groupby('has_precip')
+    .agg(dep_delay=('dep_delay','mean'), arr_delay=('arr_delay','mean'))
+    .reset_index()
+)
+weather_precip['Condition'] = weather_precip['has_precip'].map({True:'Rain', False:'No Rain'})
+
+fw['vis_cat'] = pd.cut(fw['visib'], bins=[0,2,5,10,float('inf')],
+                        labels=['Poor (0-2)','Fair (2-5)','Good (5-10)','Excellent (10+)'],
+                        include_lowest=True)
+weather_vis = fw.groupby('vis_cat', observed=True).agg(
+    dep_delay=('dep_delay','mean'), arr_delay=('arr_delay','mean')).reset_index()
+weather_vis['vis_cat'] = weather_vis['vis_cat'].astype(str)
+
+weather_temp = (
+    fw.assign(temp_bin=pd.cut(fw['temp'], bins=range(0,110,10)))
+    .groupby('temp_bin', observed=True)
+    .agg(dep_delay=('dep_delay','mean'), arr_delay=('arr_delay','mean'))
+    .reset_index()
+)
+weather_temp['temp_bin'] = weather_temp['temp_bin'].astype(str)
+
+weather_wind = (
+    fw.assign(wind_bin=pd.cut(fw['wind_speed'], bins=8))
+    .groupby('wind_bin', observed=True)
+    .agg(dep_delay=('dep_delay','mean'), arr_delay=('arr_delay','mean'))
+    .reset_index()
+)
+weather_wind['wind_bin'] = weather_wind['wind_bin'].astype(str)
+del fw, weather
+
+# Simpson's paradox
+simpsons_overall = (
+    flights.groupby('time_of_day', observed=True)['dep_delay'].mean().reset_index()
+)
+simpsons_overall.columns = ['time_of_day','avg_delay']
+simpsons_overall['time_of_day'] = simpsons_overall['time_of_day'].astype(str)
+
+simpsons_carrier = (
+    flights.merge(airlines, on='carrier', how='left')
+    .groupby(['carrier','name','time_of_day'], observed=True)['dep_delay'].mean()
+    .reset_index()
+)
+simpsons_carrier['time_of_day'] = simpsons_carrier['time_of_day'].astype(str)
+
+# Delay recovery
+valid = flights.dropna(subset=['dep_delay','arr_delay','air_time']).copy()
+valid['delay_recovered'] = valid['dep_delay'] - valid['arr_delay']
+valid['duration_category'] = pd.cut(valid['air_time'], bins=[0,60,120,180,360],
+    labels=['Very Short (<1hr)','Short (1-2hr)','Medium (2-3hr)','Long (3hr+)'])
+
+recovery_duration = (
+    valid.groupby('duration_category', observed=True)
+    .agg(dep_delay=('dep_delay','mean'), arr_delay=('arr_delay','mean'), recovered=('delay_recovered','mean'))
+    .reset_index()
+)
+recovery_duration['duration_category'] = recovery_duration['duration_category'].astype(str)
+
+scatter_sample = (
+    valid.sample(min(3000, len(valid)), random_state=42)[['dep_delay','arr_delay','carrier']]
+    .merge(airlines, on='carrier', how='left')
+)
+del valid
+
+# Airport comparison
+airport_perf = (
     flights.groupby('origin')
-    .agg(avg_dep_delay=('dep_delay', 'mean'), avg_arr_delay=('arr_delay', 'mean'),
-         cancel_rate=('cancelled', 'mean'), num_flights=('flight', 'count'))
+    .agg(avg_dep_delay=('dep_delay','mean'), avg_arr_delay=('arr_delay','mean'),
+         cancel_rate=('cancelled','mean'), n=('flight','count'))
     .round(3).reset_index()
 )
 
-# Month names
-MONTH_MAP = {1:'Jan',2:'Feb',3:'Mar',4:'Apr',5:'May',6:'Jun',
-             7:'Jul',8:'Aug',9:'Sep',10:'Oct',11:'Nov',12:'Dec'}
+airport_ci = flights.groupby('origin')['dep_delay'].agg(['mean','std','count']).round(2)
+airport_ci['se'] = airport_ci['std'] / np.sqrt(airport_ci['count'])
+airport_ci['ci'] = airport_ci['se'] * airport_ci['count'].apply(lambda n: stats.t.ppf(0.975, n-1))
+airport_ci = airport_ci.reset_index()
 
-# Carrier list for dropdowns
-carrier_options = [{'label': row['name'], 'value': row['carrier']}
-                   for _, row in airlines.sort_values('name').iterrows()]
-carrier_options_all = [{'label': 'All Carriers', 'value': 'ALL'}] + carrier_options
+# Plane age
+planes['manufacturer'] = planes['manufacturer'].str.upper().str.strip()
+conds = [planes['manufacturer'].str.contains(x, na=False)
+         for x in ['AIRBUS','BOEING','MCDONNELL|DOUGLAS','BOMBARDIER|CANADAIR','EMBRAER']]
+planes['mfr'] = np.select(conds, ['AIRBUS','BOEING','MCDONNELL DOUGLAS','BOMBARDIER','EMBRAER'],
+                            default=planes['manufacturer'])
+
+fp = flights.merge(planes[['tailnum','year','mfr']].rename(columns={'year':'year_mfr'}),
+                   on='tailnum', how='left')
+fp['plane_age'] = 2013 - fp['year_mfr']
+fp_clean = fp[(fp['plane_age']>=0)&(fp['plane_age']<=50)&fp['plane_age'].notna()].copy()
+fp_clean['age_group'] = pd.cut(fp_clean['plane_age'], bins=[0,5,10,15,20,50],
+    labels=['0-5 yrs','5-10 yrs','10-15 yrs','15-20 yrs','20+ yrs'])
+
+age_delay = (
+    fp_clean.groupby(['age_group','origin'], observed=True)['dep_delay'].mean().reset_index()
+)
+age_delay['age_group'] = age_delay['age_group'].astype(str)
+
+mfr_flights = (
+    fp.groupby('mfr').size().reset_index(name='flights')
+    .sort_values('flights').tail(10)
+)
+del fp, fp_clean, planes
 
 # ==============================================================================
-# APP SETUP
+# APP
 # ==============================================================================
 
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY],
-                suppress_callback_exceptions=True)
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
 
-CARD_STYLE  = {'backgroundColor': '#2d2d2d', 'border': '1px solid #444', 'borderRadius': '8px'}
-INSIGHT_STYLE = {
-    'backgroundColor': '#1a3a4a', 'border': '1px solid #00bcd4',
-    'borderRadius': '8px', 'padding': '12px', 'marginTop': '10px', 'fontSize': '0.9rem'
-}
+CARD = {'backgroundColor':'#2d2d2d','border':'1px solid #444','borderRadius':'8px'}
+IBOX = {'backgroundColor':'#1a3a4a','border':'1px solid #00bcd4','borderRadius':'8px',
+        'padding':'12px','marginTop':'10px','fontSize':'0.85rem','color':'#ccc'}
 
-def insight_box(text):
-    return html.Div([html.I(className="fas fa-lightbulb me-2"), text],
-                    style=INSIGHT_STYLE)
+def insight(text):
+    return html.Div(f"💡 {text}", style=IBOX)
 
-# ==============================================================================
-# LAYOUT
-# ==============================================================================
+carrier_opts     = [{'label':r['name'],'value':r['carrier']} for _,r in airlines.sort_values('name').iterrows()]
+carrier_opts_all = [{'label':'All Carriers','value':'ALL'}] + carrier_opts
 
 app.layout = dbc.Container([
-    # Header
-    dbc.Row([
-        dbc.Col(html.Div([
-            html.H1("✈️ NYC Flights 2013 — Critical Thinking Dashboard",
-                    className="text-center mb-1",
-                    style={'color': '#00bcd4', 'fontWeight': 'bold'}),
-            html.P("Causation, Confounders, and Bad Conclusions",
-                   className="text-center text-muted mb-0"),
-        ]), width=12)
-    ], className="py-3"),
+    dbc.Row(dbc.Col(html.Div([
+        html.H1("✈️ NYC Flights 2013 — Critical Thinking Dashboard",
+                className="text-center mb-1", style={'color':'#00bcd4','fontWeight':'bold'}),
+        html.P("Causation, Confounders & Bad Conclusions", className="text-center text-muted mb-0"),
+    ])), className="py-3"),
 
-    # KPI Row
     dbc.Row([
-        dbc.Col(dbc.Card([dbc.CardBody([
-            html.H4(f"{len(flights):,}", className="text-center", style={'color':'#00bcd4'}),
-            html.P("Total Flights", className="text-center text-muted mb-0")
-        ])], style=CARD_STYLE), width=3),
-        dbc.Col(dbc.Card([dbc.CardBody([
-            html.H4(f"{flights['cancelled'].mean()*100:.1f}%", className="text-center", style={'color':'#ff6b6b'}),
-            html.P("Cancellation Rate", className="text-center text-muted mb-0")
-        ])], style=CARD_STYLE), width=3),
-        dbc.Col(dbc.Card([dbc.CardBody([
-            html.H4(f"{flights['dep_delay'].mean():.1f} min", className="text-center", style={'color':'#ffd93d'}),
-            html.P("Avg Departure Delay", className="text-center text-muted mb-0")
-        ])], style=CARD_STYLE), width=3),
-        dbc.Col(dbc.Card([dbc.CardBody([
-            html.H4(f"{flights['dest'].nunique()}", className="text-center", style={'color':'#6bcb77'}),
-            html.P("Unique Destinations", className="text-center text-muted mb-0")
-        ])], style=CARD_STYLE), width=3),
+        dbc.Col(dbc.Card(dbc.CardBody([html.H4(f"{len(flights):,}", className="text-center", style={'color':'#00bcd4'}),   html.P("Total Flights",    className="text-center text-muted mb-0")]), style=CARD), width=3),
+        dbc.Col(dbc.Card(dbc.CardBody([html.H4(f"{flights['cancelled'].mean()*100:.1f}%", className="text-center", style={'color':'#ff6b6b'}), html.P("Cancel Rate",      className="text-center text-muted mb-0")]), style=CARD), width=3),
+        dbc.Col(dbc.Card(dbc.CardBody([html.H4(f"{flights['dep_delay'].mean():.1f} min",  className="text-center", style={'color':'#ffd93d'}), html.P("Avg Dep Delay",   className="text-center text-muted mb-0")]), style=CARD), width=3),
+        dbc.Col(dbc.Card(dbc.CardBody([html.H4(f"{flights['dest'].nunique()}",             className="text-center", style={'color':'#6bcb77'}), html.P("Destinations",    className="text-center text-muted mb-0")]), style=CARD), width=3),
     ], className="mb-3"),
 
-    # Tabs
     dbc.Tabs([
 
-        # ── TAB 1: CANCELLATIONS ─────────────────────────────────────────────
-        dbc.Tab(label="🚫 Cancellations", tab_id="tab-cancel", children=[
-            dbc.Row([
-                dbc.Col([
-                    html.H4("Cancelled Flights by Month", className="mt-3"),
-                    dcc.Graph(id='cancel-by-month'),
-                    insight_box("🚨 SELECTION BIAS: February has high cancellations due to winter weather — but the flights that flew show lower-than-expected delays. The worst conditions got cancelled, so we never see them. This is survivor bias.")
-                ], width=6),
-                dbc.Col([
-                    html.H4("SFO Cancellations by Carrier", className="mt-3"),
-                    dcc.Dropdown(
-                        id='cancel-month-dropdown',
-                        options=[{'label': f'Month: {v}', 'value': k} for k, v in MONTH_MAP.items()],
-                        value=None, placeholder="Filter by month (optional)",
-                        style={'color': '#000'}
-                    ),
-                    dcc.Graph(id='sfo-cancel-chart'),
-                ], width=6),
-            ]),
-        ]),
+        dbc.Tab(label="🚫 Cancellations", tab_id="t1", children=[dbc.Row([
+            dbc.Col([html.H4("Cancelled Flights by Month", className="mt-3"),
+                     dcc.Graph(id='g-cancel-month'),
+                     insight("SELECTION BIAS: February's worst flights got cancelled so they never appear in delay stats. Only 'survivors' remain — classic survivor bias.")], width=6),
+            dbc.Col([html.H4("SFO Cancellations by Carrier", className="mt-3"),
+                     dcc.Dropdown(id='dd-cancel-month',
+                         options=[{'label':f'Month: {v}','value':k} for k,v in MONTH_MAP.items()],
+                         value=None, placeholder="Filter by month...", style={'color':'#000'}),
+                     dcc.Graph(id='g-sfo-cancel')], width=6),
+        ])]),
 
-        # ── TAB 2: CARRIER PERFORMANCE ───────────────────────────────────────
-        dbc.Tab(label="🏆 Carrier Performance", tab_id="tab-carrier", children=[
-            dbc.Row([
-                dbc.Col([
-                    html.H4("Naive Carrier Ranking (Don't Trust This Yet!)", className="mt-3"),
-                    dcc.RadioItems(
-                        id='delay-type-radio',
-                        options=[
-                            {'label': ' Arrival Delay', 'value': 'arr_delay'},
-                            {'label': ' Departure Delay', 'value': 'dep_delay'},
-                        ],
-                        value='arr_delay', inline=True, className="mb-2",
-                        style={'color': 'white'}
-                    ),
-                    dcc.Graph(id='carrier-naive-chart'),
-                    insight_box("⚠️ CONFOUNDING: Different carriers fly different routes. Comparing raw delays is like comparing apples to oranges — some carriers specialize in difficult, long-distance routes."),
-                ], width=6),
-                dbc.Col([
-                    html.H4("Route Difficulty by Carrier", className="mt-3"),
-                    dcc.Graph(id='carrier-route-mix'),
-                    insight_box("💡 REVEALED: Carriers flying harder routes (longer, more congested) will always look worse in raw rankings. This is confounding — route difficulty, not carrier quality, drives the apparent difference."),
-                ], width=6),
-            ]),
-        ]),
+        dbc.Tab(label="🏆 Carriers", tab_id="t2", children=[dbc.Row([
+            dbc.Col([html.H4("Naive Carrier Ranking ⚠️", className="mt-3"),
+                     dcc.RadioItems(id='ri-delay-type',
+                         options=[{'label':' Arrival Delay','value':'arr_delay'},
+                                  {'label':' Departure Delay','value':'dep_delay'}],
+                         value='arr_delay', inline=True, style={'color':'white'}, className="mb-2"),
+                     dcc.Graph(id='g-carrier-naive'),
+                     insight("CONFOUNDING: Different carriers fly different routes. Raw delay rankings are misleading.")], width=6),
+            dbc.Col([html.H4("Route Difficulty by Carrier", className="mt-3"),
+                     dcc.Graph(id='g-route-mix'),
+                     insight("Carriers on harder routes (longer, more congested) look worse — but it's the route, not the carrier.")], width=6),
+        ])]),
 
-        # ── TAB 3: WEATHER IMPACT ─────────────────────────────────────────────
-        dbc.Tab(label="🌦️ Weather Impact", tab_id="tab-weather", children=[
-            dbc.Row([
-                dbc.Col([
-                    html.H4("Weather Factor Explorer", className="mt-3"),
-                    dcc.Dropdown(
-                        id='weather-factor-dropdown',
-                        options=[
-                            {'label': 'Precipitation', 'value': 'precip'},
-                            {'label': 'Visibility', 'value': 'visib'},
-                            {'label': 'Temperature (°F)', 'value': 'temp'},
-                            {'label': 'Wind Speed', 'value': 'wind_speed'},
-                        ],
-                        value='visib', style={'color': '#000'}
-                    ),
-                    dcc.RadioItems(
-                        id='weather-delay-type',
-                        options=[
-                            {'label': ' Departure Delay', 'value': 'dep_delay'},
-                            {'label': ' Arrival Delay', 'value': 'arr_delay'},
-                        ],
-                        value='dep_delay', inline=True, className="mt-2",
-                        style={'color': 'white'}
-                    ),
-                    dcc.Graph(id='weather-chart'),
-                ], width=6),
-                dbc.Col([
-                    html.H4("Precipitation Impact", className="mt-3"),
-                    dcc.Graph(id='precip-chart'),
-                    insight_box("🌤️ Even though weather CORRELATES with delays, it's not purely causal. Bad weather → some flights cancel → only 'survivable' flights appear in delay data. Seasonal confounding also exists."),
-                ], width=6),
-            ]),
-        ]),
+        dbc.Tab(label="🌦️ Weather", tab_id="t3", children=[dbc.Row([
+            dbc.Col([html.H4("Weather Factor vs Delay", className="mt-3"),
+                     dcc.Dropdown(id='dd-weather',
+                         options=[{'label':'Visibility','value':'vis'},
+                                  {'label':'Temperature','value':'temp'},
+                                  {'label':'Wind Speed','value':'wind'}],
+                         value='vis', style={'color':'#000'}),
+                     dcc.RadioItems(id='ri-weather-delay',
+                         options=[{'label':' Dep Delay','value':'dep_delay'},{'label':' Arr Delay','value':'arr_delay'}],
+                         value='dep_delay', inline=True, style={'color':'white'}, className="mt-2"),
+                     dcc.Graph(id='g-weather')], width=6),
+            dbc.Col([html.H4("Precipitation Impact", className="mt-3"),
+                     dcc.Graph(id='g-precip'),
+                     insight("Weather correlates with delays, but seasonality and selection bias (cancelled flights disappear) are confounders.")], width=6),
+        ])]),
 
-        # ── TAB 4: SIMPSON'S PARADOX ──────────────────────────────────────────
-        dbc.Tab(label="🎭 Simpson's Paradox", tab_id="tab-simpson", children=[
-            dbc.Row([
-                dbc.Col([
-                    html.H4("Overall: Delay by Time of Day", className="mt-3"),
-                    dcc.Graph(id='simpsons-overall'),
-                    insight_box("📊 OVERALL PATTERN: Evening flights are delayed most. Seems clear, right?"),
-                ], width=5),
-                dbc.Col([
-                    html.H4("By Carrier: The Paradox Appears", className="mt-3"),
-                    dcc.Dropdown(
-                        id='simpsons-carrier-dropdown',
-                        options=carrier_options,
-                        value=['UA', 'AA', 'DL', 'B6', 'EV'],
-                        multi=True, style={'color': '#000'}
-                    ),
-                    dcc.Graph(id='simpsons-by-carrier'),
-                    insight_box("🎭 SIMPSON'S PARADOX: The aggregate pattern can REVERSE when you look within subgroups. Different carriers operate different schedules and routes at different times of day."),
-                ], width=7),
-            ]),
-        ]),
+        dbc.Tab(label="🎭 Simpson's Paradox", tab_id="t4", children=[dbc.Row([
+            dbc.Col([html.H4("Overall Pattern", className="mt-3"),
+                     dcc.Graph(id='g-simpson-overall'),
+                     insight("Overall: evening flights = most delayed. Seems obvious...")], width=5),
+            dbc.Col([html.H4("By Carrier: The Paradox", className="mt-3"),
+                     dcc.Dropdown(id='dd-simpson-carriers',
+                         options=carrier_opts, value=['UA','AA','DL','B6','EV'],
+                         multi=True, style={'color':'#000'}),
+                     dcc.Graph(id='g-simpson-carrier'),
+                     insight("The pattern can REVERSE within subgroups. Different carriers operate different schedules at different times — aggregate patterns mislead.")], width=7),
+        ])]),
 
-        # ── TAB 5: DELAY RECOVERY ─────────────────────────────────────────────
-        dbc.Tab(label="↩️ Delay Recovery", tab_id="tab-recovery", children=[
-            dbc.Row([
-                dbc.Col([
-                    html.H4("Departure vs Arrival Delay", className="mt-3"),
-                    dcc.Dropdown(
-                        id='recovery-carrier-dropdown',
-                        options=carrier_options_all,
-                        value='ALL', style={'color': '#000'}
-                    ),
-                    dcc.Graph(id='dep-arr-scatter'),
-                ], width=6),
-                dbc.Col([
-                    html.H4("Delay Recovered by Flight Duration", className="mt-3"),
-                    dcc.Graph(id='recovery-by-duration'),
-                    insight_box("✈️ CONFOUNDER: Longer flights have more time to make up delays. If you rank carriers by ARRIVAL delay, you're biased towards carriers flying shorter routes — not necessarily better performers."),
-                ], width=6),
-            ]),
-        ]),
+        dbc.Tab(label="↩️ Delay Recovery", tab_id="t5", children=[dbc.Row([
+            dbc.Col([html.H4("Departure vs Arrival Delay", className="mt-3"),
+                     dcc.Dropdown(id='dd-recovery-carrier', options=carrier_opts_all, value='ALL', style={'color':'#000'}),
+                     dcc.Graph(id='g-dep-arr')], width=6),
+            dbc.Col([html.H4("Delay Recovered by Flight Duration", className="mt-3"),
+                     dcc.Graph(id='g-recovery-duration'),
+                     insight("CONFOUNDER: Longer flights make up delays in the air. Ranking by arrival delay biases against short-haul carriers.")], width=6),
+        ])]),
 
-        # ── TAB 6: AIRPORT COMPARISON ─────────────────────────────────────────
-        dbc.Tab(label="🏙️ Airport Comparison", tab_id="tab-airport", children=[
-            dbc.Row([
-                dbc.Col([
-                    html.H4("Airport Performance — Multiple Metrics", className="mt-3"),
-                    dcc.Graph(id='airport-metrics'),
-                    insight_box("🏆 'Best' depends on what you optimise for! EWR, JFK, and LGA rank differently depending on whether you care about departure delay, arrival delay, or cancellation rate."),
-                ], width=6),
-                dbc.Col([
-                    html.H4("Statistical vs Practical Significance", className="mt-3"),
-                    dcc.Graph(id='airport-ci-chart'),
-                    insight_box("📊 With 100K+ flights, even a 1-minute difference is statistically significant (p < 0.05). But is 1-2 minutes practically meaningful? Large datasets make EVERYTHING 'significant'. Always ask: So what?"),
-                ], width=6),
-            ]),
-        ]),
+        dbc.Tab(label="🏙️ Airports", tab_id="t6", children=[dbc.Row([
+            dbc.Col([html.H4("Airport Performance Metrics", className="mt-3"),
+                     dcc.Graph(id='g-airport-metrics'),
+                     insight("'Best' airport depends on the metric. EWR, JFK, LGA rank differently for dep delay vs arr delay vs cancellation rate.")], width=6),
+            dbc.Col([html.H4("Statistical vs Practical Significance", className="mt-3"),
+                     dcc.Graph(id='g-airport-ci'),
+                     insight("With 100K+ flights, even 1 minute is statistically significant. But is it practically meaningful?")], width=6),
+        ])]),
 
-        # ── TAB 7: PLANE AGE ──────────────────────────────────────────────────
-        dbc.Tab(label="🛩️ Plane Age", tab_id="tab-age", children=[
-            dbc.Row([
-                dbc.Col([
-                    html.H4("Delay by Plane Age", className="mt-3"),
-                    dcc.Dropdown(
-                        id='age-origin-dropdown',
-                        options=[{'label': 'All Airports', 'value': 'ALL'},
-                                 {'label': 'JFK', 'value': 'JFK'},
-                                 {'label': 'LGA', 'value': 'LGA'},
-                                 {'label': 'EWR', 'value': 'EWR'}],
-                        value='ALL', style={'color': '#000'}
-                    ),
-                    dcc.Graph(id='age-delay-chart'),
-                    insight_box("🤔 Even if older planes correlate with delays, we can't say they CAUSE delays. Confounders: older planes may fly different routes, be operated by different carriers, or be used for different purposes."),
-                ], width=6),
-                dbc.Col([
-                    html.H4("Top Manufacturers by Flights", className="mt-3"),
-                    dcc.Graph(id='manufacturer-chart'),
-                ], width=6),
-            ]),
-        ]),
+        dbc.Tab(label="🛩️ Plane Age", tab_id="t7", children=[dbc.Row([
+            dbc.Col([html.H4("Delay by Plane Age", className="mt-3"),
+                     dcc.Dropdown(id='dd-age-origin',
+                         options=[{'label':'All Airports','value':'ALL'},
+                                  {'label':'JFK','value':'JFK'},
+                                  {'label':'LGA','value':'LGA'},
+                                  {'label':'EWR','value':'EWR'}],
+                         value='ALL', style={'color':'#000'}),
+                     dcc.Graph(id='g-age-delay'),
+                     insight("Even if old planes correlate with delays, route assignment and airline operations are confounders.")], width=6),
+            dbc.Col([html.H4("Top Manufacturers by Flights", className="mt-3"),
+                     dcc.Graph(id='g-mfr')], width=6),
+        ])]),
 
-        # ── TAB 8: YIELD CURVE ────────────────────────────────────────────────
-        dbc.Tab(label="📈 Yield Curve", tab_id="tab-yield", children=[
-            dbc.Row([
-                dbc.Col([
-                    html.H4("US Yield Curve Inversions & Recessions", className="mt-3 mb-1"),
-                    html.P("10-Year minus 3-Month Treasury Spread. Negative = Inversion = Warning Signal.",
-                           className="text-muted small"),
-                    dcc.DatePickerRange(
-                        id='yield-date-range',
-                        min_date_allowed='1960-01-01',
-                        max_date_allowed='2024-12-31',
-                        start_date='1990-01-01',
-                        end_date='2024-12-31',
-                        style={'backgroundColor': '#333'}
-                    ),
-                    dcc.Graph(id='yield-curve-chart'),
-                    insight_box("📈 Every inversion (spread < 0) was followed by a recession within 6-18 months. BUT: inversions don't CAUSE recessions — both are symptoms of the same underlying conditions (Fed tightening, credit stress, etc.)."),
-                ], width=12),
-            ]),
-        ]),
+        dbc.Tab(label="📈 Yield Curve", tab_id="t8", children=[dbc.Row([
+            dbc.Col([html.H4("US Yield Curve Inversions & Recessions", className="mt-3"),
+                     html.P("10-Year minus 3-Month Treasury Spread. Red = Inversion.", className="text-muted small"),
+                     dcc.DatePickerRange(id='dp-yield',
+                         min_date_allowed='1970-01-01', max_date_allowed='2024-12-31',
+                         start_date='1990-01-01', end_date='2024-12-31'),
+                     dcc.Graph(id='g-yield'),
+                     insight("Every inversion was followed by recession within 6-18 months. But inversions don't CAUSE recessions — both reflect the same underlying conditions.")], width=12),
+        ])]),
 
-    ], id="main-tabs", active_tab="tab-cancel"),
-
-], fluid=True, style={'backgroundColor': '#1a1a2e', 'minHeight': '100vh'})
-
+    ], active_tab="t1"),
+], fluid=True, style={'backgroundColor':'#1a1a2e','minHeight':'100vh'})
 
 # ==============================================================================
 # CALLBACKS
 # ==============================================================================
 
-# ── Cancellations by month ────────────────────────────────────────────────────
-@app.callback(Output('cancel-by-month', 'figure'), Input('main-tabs', 'active_tab'))
-def update_cancel_month(_):
-    data = (
-        flights.assign(cancelled=flights['dep_time'].isna().astype(int))
-        .groupby('month')
-        .agg(total=('cancelled', 'count'), cancelled=('cancelled', 'sum'))
-        .assign(prop=lambda x: x['cancelled'] / x['total'] * 100)
-        .reset_index()
-    )
-    data['month_name'] = data['month'].map(MONTH_MAP)
-    fig = px.bar(data, x='month_name', y='prop',
-                 labels={'prop': 'Cancellation %', 'month_name': 'Month'},
-                 color='prop', color_continuous_scale='RdYlGn_r',
-                 template='plotly_dark')
-    fig.update_layout(showlegend=False, coloraxis_showscale=False,
-                      margin=dict(t=20, b=20))
+@app.callback(Output('g-cancel-month','figure'), Input('g-cancel-month','id'))
+def cb_cancel_month(_):
+    fig = px.bar(cancel_month, x='month_name', y='pct', color='pct',
+                 color_continuous_scale='RdYlGn_r', template='plotly_dark',
+                 labels={'pct':'Cancel %','month_name':'Month'})
+    fig.update_layout(coloraxis_showscale=False, margin=dict(t=20))
     return fig
 
-# ── SFO cancellations ─────────────────────────────────────────────────────────
-@app.callback(Output('sfo-cancel-chart', 'figure'), Input('cancel-month-dropdown', 'value'))
-def update_sfo_cancel(month_val):
-    sfo = (
-        flights[flights['dest'] == 'SFO']
-        .assign(is_cancelled=lambda x: x['dep_time'].isna())
-        .groupby(['month', 'carrier'])
-        .agg(total=('is_cancelled', 'count'), cancelled=('is_cancelled', 'sum'))
-        .assign(pct=lambda x: x['cancelled'] / x['total'] * 100)
-        .reset_index()
-        .merge(airlines, on='carrier', how='left')
-    )
-    sfo['month_name'] = sfo['month'].map(MONTH_MAP)
-    if month_val:
-        sfo = sfo[sfo['month'] == month_val]
-    fig = px.bar(sfo, x='month_name', y='pct', color='name', barmode='group',
-                 labels={'pct': 'Cancel %', 'month_name': 'Month', 'name': 'Airline'},
-                 template='plotly_dark')
-    fig.update_layout(margin=dict(t=20, b=20), legend=dict(font=dict(size=9)))
+@app.callback(Output('g-sfo-cancel','figure'), Input('dd-cancel-month','value'))
+def cb_sfo_cancel(month):
+    d = sfo_cancel if not month else sfo_cancel[sfo_cancel['month']==month]
+    fig = px.bar(d, x='month_name', y='pct', color='name', barmode='group',
+                 template='plotly_dark', labels={'pct':'Cancel %','month_name':'Month','name':'Airline'})
+    fig.update_layout(margin=dict(t=20), legend=dict(font=dict(size=8)))
     return fig
 
-# ── Carrier naive ranking ─────────────────────────────────────────────────────
-@app.callback(Output('carrier-naive-chart', 'figure'), Input('delay-type-radio', 'value'))
-def update_carrier_naive(delay_col):
-    data = (
-        flights_named.dropna(subset=[delay_col])
-        .groupby('name')[delay_col].mean()
-        .reset_index()
-        .sort_values(delay_col, ascending=True)
-    )
-    data.columns = ['Airline', 'avg_delay']
-    colors = ['#ff6b6b' if v > 0 else '#6bcb77' for v in data['avg_delay']]
-    fig = px.bar(data, x='avg_delay', y='Airline', orientation='h',
-                 labels={'avg_delay': 'Avg Delay (min)', 'Airline': ''},
-                 template='plotly_dark', color='avg_delay',
-                 color_continuous_scale='RdYlGn_r')
+@app.callback(Output('g-carrier-naive','figure'), Input('ri-delay-type','value'))
+def cb_carrier_naive(col):
+    d = carrier_delays.sort_values(col)
+    fig = px.bar(d, x=col, y='name', orientation='h', color=col,
+                 color_continuous_scale='RdYlGn_r', template='plotly_dark',
+                 labels={col:'Avg Delay (min)','name':''})
     fig.add_vline(x=0, line_dash='dash', line_color='white')
-    fig.update_layout(margin=dict(t=20), coloraxis_showscale=False, height=350)
+    fig.update_layout(coloraxis_showscale=False, margin=dict(t=20), height=380)
     return fig
 
-# ── Carrier route mix ─────────────────────────────────────────────────────────
-@app.callback(Output('carrier-route-mix', 'figure'), Input('main-tabs', 'active_tab'))
-def update_carrier_route(_):
-    frd = flights.merge(route_delays[['origin', 'dest', 'avg_delay', 'avg_distance']],
-                        on=['origin', 'dest'], how='left').merge(airlines, on='carrier')
-    data = (
-        frd.groupby('name')
-        .agg(route_avg_delay=('avg_delay', 'mean'), avg_distance=('avg_distance', 'mean'),
-             num_flights=('avg_delay', 'count'))
-        .reset_index()
-    )
-    fig = px.scatter(data, x='avg_distance', y='route_avg_delay', size='num_flights',
-                     text='name', template='plotly_dark',
-                     labels={'avg_distance': 'Avg Route Distance (miles)',
-                             'route_avg_delay': 'Avg Route Difficulty (delay min)',
-                             'name': 'Airline'},
-                     color='route_avg_delay', color_continuous_scale='RdYlGn_r')
+@app.callback(Output('g-route-mix','figure'), Input('g-route-mix','id'))
+def cb_route_mix(_):
+    fig = px.scatter(carrier_route, x='avg_distance', y='route_avg_delay',
+                     size='num_flights', text='name', template='plotly_dark',
+                     color='route_avg_delay', color_continuous_scale='RdYlGn_r',
+                     labels={'avg_distance':'Avg Distance (mi)','route_avg_delay':'Route Difficulty (min)'})
     fig.update_traces(textposition='top center', textfont_size=8)
-    fig.update_layout(margin=dict(t=20), coloraxis_showscale=False, height=350)
+    fig.update_layout(coloraxis_showscale=False, margin=dict(t=20), height=380)
     return fig
 
-# ── Weather chart ─────────────────────────────────────────────────────────────
-@app.callback(Output('weather-chart', 'figure'),
-              Input('weather-factor-dropdown', 'value'),
-              Input('weather-delay-type', 'value'))
-def update_weather(factor, delay_col):
-    fw = flights_weather.dropna(subset=[factor, delay_col])
-    if factor == 'precip':
-        fw['bin'] = (fw[factor] > 0).map({True: 'Rain', False: 'No Rain'})
-    elif factor == 'visib':
-        fw['bin'] = fw['visibility_category'].astype(str)
+@app.callback(Output('g-weather','figure'), Input('dd-weather','value'), Input('ri-weather-delay','value'))
+def cb_weather(factor, delay_col):
+    if factor == 'vis':
+        d = weather_vis[['vis_cat', delay_col]].rename(columns={'vis_cat':'Category', delay_col:'avg_delay'})
+        xlabel = 'Visibility'
     elif factor == 'temp':
-        fw['bin'] = pd.cut(fw[factor], bins=range(0, 110, 10)).astype(str)
+        d = weather_temp[['temp_bin', delay_col]].rename(columns={'temp_bin':'Category', delay_col:'avg_delay'})
+        xlabel = 'Temperature (F)'
     else:
-        fw['bin'] = pd.cut(fw[factor], bins=8).astype(str)
-
-    data = fw.groupby('bin')[delay_col].mean().reset_index()
-    data.columns = ['Category', 'avg_delay']
-    fig = px.bar(data, x='Category', y='avg_delay',
-                 labels={'avg_delay': f'Avg {delay_col.replace("_", " ").title()} (min)',
-                         'Category': factor.replace('_', ' ').title()},
-                 color='avg_delay', color_continuous_scale='RdYlGn_r',
-                 template='plotly_dark')
+        d = weather_wind[['wind_bin', delay_col]].rename(columns={'wind_bin':'Category', delay_col:'avg_delay'})
+        xlabel = 'Wind Speed'
+    fig = px.bar(d.dropna(), x='Category', y='avg_delay', color='avg_delay',
+                 color_continuous_scale='RdYlGn_r', template='plotly_dark',
+                 labels={'avg_delay':'Avg Delay (min)','Category':xlabel})
     fig.add_hline(y=0, line_dash='dash', line_color='white')
-    fig.update_layout(margin=dict(t=20), coloraxis_showscale=False)
+    fig.update_layout(coloraxis_showscale=False, margin=dict(t=20))
     return fig
 
-# ── Precipitation impact ──────────────────────────────────────────────────────
-@app.callback(Output('precip-chart', 'figure'), Input('main-tabs', 'active_tab'))
-def update_precip(_):
-    data = (
-        flights_weather.groupby('has_precip')
-        .agg(dep_delay=('dep_delay', 'mean'), arr_delay=('arr_delay', 'mean'))
-        .reset_index()
-    )
-    data['Condition'] = data['has_precip'].map({True: '🌧️ Rain', False: '☀️ No Rain'})
-    fig = px.bar(data.melt(id_vars='Condition', value_vars=['dep_delay', 'arr_delay'],
-                            var_name='Delay Type', value_name='Minutes'),
-                 x='Condition', y='Minutes', color='Delay Type', barmode='group',
-                 template='plotly_dark',
-                 labels={'Minutes': 'Avg Delay (min)'})
+@app.callback(Output('g-precip','figure'), Input('g-precip','id'))
+def cb_precip(_):
+    d = weather_precip.melt(id_vars='Condition', value_vars=['dep_delay','arr_delay'],
+                             var_name='Type', value_name='Minutes')
+    d['Type'] = d['Type'].map({'dep_delay':'Dep Delay','arr_delay':'Arr Delay'})
+    fig = px.bar(d, x='Condition', y='Minutes', color='Type', barmode='group',
+                 template='plotly_dark', labels={'Minutes':'Avg Delay (min)'})
     fig.update_layout(margin=dict(t=20))
     return fig
 
-# ── Simpson's overall ─────────────────────────────────────────────────────────
-@app.callback(Output('simpsons-overall', 'figure'), Input('main-tabs', 'active_tab'))
-def update_simpsons_overall(_):
-    data = (
-        flights.groupby('time_of_day', observed=True)['dep_delay'].mean()
-        .reset_index()
-    )
-    data.columns = ['Time of Day', 'avg_delay']
-    order = ['Night', 'Morning', 'Afternoon', 'Evening']
-    data['Time of Day'] = pd.Categorical(data['Time of Day'].astype(str), categories=order, ordered=True)
-    data = data.sort_values('Time of Day')
-    fig = px.bar(data, x='Time of Day', y='avg_delay',
-                 color='avg_delay', color_continuous_scale='RdYlGn_r',
-                 labels={'avg_delay': 'Avg Dep Delay (min)'},
-                 template='plotly_dark')
-    fig.update_layout(margin=dict(t=20), coloraxis_showscale=False)
+@app.callback(Output('g-simpson-overall','figure'), Input('g-simpson-overall','id'))
+def cb_simpsons_overall(_):
+    order = ['Night','Morning','Afternoon','Evening']
+    d = simpsons_overall.copy()
+    d['time_of_day'] = pd.Categorical(d['time_of_day'], categories=order, ordered=True)
+    d = d.sort_values('time_of_day')
+    fig = px.bar(d, x='time_of_day', y='avg_delay', color='avg_delay',
+                 color_continuous_scale='RdYlGn_r', template='plotly_dark',
+                 labels={'avg_delay':'Avg Dep Delay (min)','time_of_day':'Time of Day'})
+    fig.update_layout(coloraxis_showscale=False, margin=dict(t=20))
     return fig
 
-# ── Simpson's by carrier ──────────────────────────────────────────────────────
-@app.callback(Output('simpsons-by-carrier', 'figure'), Input('simpsons-carrier-dropdown', 'value'))
-def update_simpsons_carrier(carriers):
-    if not carriers:
-        carriers = ['UA', 'AA', 'DL']
-    ct = (
-        flights[flights['carrier'].isin(carriers)]
-        .groupby(['carrier', 'time_of_day'], observed=True)['dep_delay'].mean()
-        .reset_index()
-        .merge(airlines, on='carrier', how='left')
-    )
-    ct['time_of_day'] = ct['time_of_day'].astype(str)
-    order = ['Night', 'Morning', 'Afternoon', 'Evening']
-    ct['time_of_day'] = pd.Categorical(ct['time_of_day'], categories=order, ordered=True)
-    ct = ct.sort_values('time_of_day')
-    fig = px.line(ct, x='time_of_day', y='dep_delay', color='name', markers=True,
-                  labels={'dep_delay': 'Avg Dep Delay (min)', 'time_of_day': 'Time of Day', 'name': 'Airline'},
-                  template='plotly_dark')
+@app.callback(Output('g-simpson-carrier','figure'), Input('dd-simpson-carriers','value'))
+def cb_simpsons_carrier(carriers):
+    if not carriers: carriers = ['UA','AA','DL']
+    order = ['Night','Morning','Afternoon','Evening']
+    d = simpsons_carrier[simpsons_carrier['carrier'].isin(carriers)].copy()
+    d['time_of_day'] = pd.Categorical(d['time_of_day'], categories=order, ordered=True)
+    d = d.sort_values('time_of_day')
+    fig = px.line(d, x='time_of_day', y='dep_delay', color='name', markers=True,
+                  template='plotly_dark',
+                  labels={'dep_delay':'Avg Dep Delay (min)','time_of_day':'Time of Day','name':'Airline'})
     fig.add_hline(y=0, line_dash='dash', line_color='grey', opacity=0.5)
     fig.update_layout(margin=dict(t=20))
     return fig
 
-# ── Dep vs arr scatter ────────────────────────────────────────────────────────
-@app.callback(Output('dep-arr-scatter', 'figure'), Input('recovery-carrier-dropdown', 'value'))
-def update_dep_arr(carrier_val):
-    if carrier_val == 'ALL':
-        data = valid.sample(min(5000, len(valid)), random_state=42)
-    else:
-        data = valid[valid['carrier'] == carrier_val].sample(min(5000, len(valid[valid['carrier'] == carrier_val])), random_state=42)
-    fig = px.scatter(data, x='dep_delay', y='arr_delay', opacity=0.3,
-                     labels={'dep_delay': 'Departure Delay (min)', 'arr_delay': 'Arrival Delay (min)'},
-                     template='plotly_dark', color_discrete_sequence=['#00bcd4'])
-    fig.add_shape(type='line',
-                  x0=data['dep_delay'].min(), y0=data['dep_delay'].min(),
-                  x1=data['dep_delay'].max(), y1=data['dep_delay'].max(),
-                  line=dict(color='red', dash='dash'))
+@app.callback(Output('g-dep-arr','figure'), Input('dd-recovery-carrier','value'))
+def cb_dep_arr(carrier):
+    d = scatter_sample if carrier == 'ALL' else scatter_sample[scatter_sample['carrier']==carrier]
+    fig = px.scatter(d, x='dep_delay', y='arr_delay', opacity=0.3, template='plotly_dark',
+                     color_discrete_sequence=['#00bcd4'],
+                     labels={'dep_delay':'Dep Delay (min)','arr_delay':'Arr Delay (min)'})
+    if len(d) > 0:
+        mn, mx = float(d['dep_delay'].min()), float(d['dep_delay'].max())
+        fig.add_shape(type='line', x0=mn, y0=mn, x1=mx, y1=mx,
+                      line=dict(color='red', dash='dash'))
     fig.update_layout(margin=dict(t=20), height=350)
     return fig
 
-# ── Recovery by duration ──────────────────────────────────────────────────────
-@app.callback(Output('recovery-by-duration', 'figure'), Input('main-tabs', 'active_tab'))
-def update_recovery_duration(_):
-    data = (
-        valid.groupby('duration_category', observed=True)
-        .agg(dep_delay=('dep_delay', 'mean'), arr_delay=('arr_delay', 'mean'),
-             recovered=('delay_recovered', 'mean'))
-        .reset_index()
-    )
-    data['duration_category'] = data['duration_category'].astype(str)
-    fig = px.bar(data.melt(id_vars='duration_category', value_vars=['dep_delay', 'arr_delay', 'recovered'],
-                            var_name='Metric', value_name='Minutes'),
-                 x='duration_category', y='Minutes', color='Metric', barmode='group',
-                 labels={'duration_category': 'Flight Duration', 'Minutes': 'Avg (min)'},
-                 template='plotly_dark')
+@app.callback(Output('g-recovery-duration','figure'), Input('g-recovery-duration','id'))
+def cb_recovery_duration(_):
+    d = recovery_duration.melt(id_vars='duration_category',
+                                value_vars=['dep_delay','arr_delay','recovered'],
+                                var_name='Metric', value_name='Minutes')
+    d['Metric'] = d['Metric'].map({'dep_delay':'Dep Delay','arr_delay':'Arr Delay','recovered':'Recovered'})
+    fig = px.bar(d, x='duration_category', y='Minutes', color='Metric', barmode='group',
+                 template='plotly_dark', labels={'duration_category':'Flight Duration'})
     fig.update_layout(margin=dict(t=20))
     return fig
 
-# ── Airport metrics ───────────────────────────────────────────────────────────
-@app.callback(Output('airport-metrics', 'figure'), Input('main-tabs', 'active_tab'))
-def update_airport_metrics(_):
-    data = airport_performance.melt(id_vars='origin',
-                                    value_vars=['avg_dep_delay', 'avg_arr_delay'],
-                                    var_name='Metric', value_name='Value')
-    data['Metric'] = data['Metric'].map({'avg_dep_delay': 'Avg Dep Delay', 'avg_arr_delay': 'Avg Arr Delay'})
-    fig = px.bar(data, x='origin', y='Value', color='Metric', barmode='group',
-                 labels={'Value': 'Minutes', 'origin': 'Airport'},
-                 template='plotly_dark')
+@app.callback(Output('g-airport-metrics','figure'), Input('g-airport-metrics','id'))
+def cb_airport_metrics(_):
+    d = airport_perf.melt(id_vars='origin', value_vars=['avg_dep_delay','avg_arr_delay'],
+                           var_name='Metric', value_name='Value')
+    d['Metric'] = d['Metric'].map({'avg_dep_delay':'Avg Dep Delay','avg_arr_delay':'Avg Arr Delay'})
+    fig = px.bar(d, x='origin', y='Value', color='Metric', barmode='group',
+                 template='plotly_dark', labels={'Value':'Minutes','origin':'Airport'})
     fig.update_layout(margin=dict(t=20))
     return fig
 
-# ── Airport CI chart ──────────────────────────────────────────────────────────
-@app.callback(Output('airport-ci-chart', 'figure'), Input('main-tabs', 'active_tab'))
-def update_airport_ci(_):
-    airport_stats = (
-        flights.groupby('origin')['dep_delay']
-        .agg(['mean', 'std', 'count']).round(2)
-    )
-    airport_stats['se'] = airport_stats['std'] / np.sqrt(airport_stats['count'])
-    airport_stats['ci'] = airport_stats['se'] * stats.t.ppf(0.975, airport_stats['count'] - 1)
-    airport_stats = airport_stats.reset_index()
-
+@app.callback(Output('g-airport-ci','figure'), Input('g-airport-ci','id'))
+def cb_airport_ci(_):
+    colors = {'JFK':'#1f77b4','LGA':'#ff7f0e','EWR':'#2ca02c'}
     fig = go.Figure()
-    colors = {'JFK': '#1f77b4', 'LGA': '#ff7f0e', 'EWR': '#2ca02c'}
-    for _, row in airport_stats.iterrows():
+    for _, row in airport_ci.iterrows():
         fig.add_trace(go.Scatter(
             x=[row['origin']], y=[row['mean']],
             error_y=dict(type='data', array=[row['ci']], visible=True),
-            mode='markers', marker=dict(size=14, color=colors.get(row['origin'], 'white')),
+            mode='markers', marker=dict(size=14, color=colors.get(row['origin'],'white')),
             name=row['origin']
         ))
-    fig.update_layout(
-        template='plotly_dark', yaxis_title='Avg Dep Delay (min)',
-        xaxis_title='Airport', margin=dict(t=20),
-        annotations=[dict(text="Error bars = 95% CI (statistically significant but practically tiny!)",
-                         xref='paper', yref='paper', x=0, y=-0.15, showarrow=False,
-                         font=dict(size=10, color='grey'))]
-    )
+    fig.update_layout(template='plotly_dark', yaxis_title='Avg Dep Delay (min)',
+                      xaxis_title='Airport', margin=dict(t=20, b=60),
+                      annotations=[dict(
+                          text="Error bars = 95% CI — statistically significant but practically tiny!",
+                          xref='paper', yref='paper', x=0, y=-0.25,
+                          showarrow=False, font=dict(size=9, color='grey'))])
     return fig
 
-# ── Plane age chart ───────────────────────────────────────────────────────────
-@app.callback(Output('age-delay-chart', 'figure'), Input('age-origin-dropdown', 'value'))
-def update_age_delay(origin_val):
-    data = flights_planes_clean.copy()
-    if origin_val != 'ALL':
-        data = data[data['origin'] == origin_val]
-    age_data = (
-        data.groupby('age_group', observed=True)['dep_delay'].mean()
-        .reset_index()
-    )
-    age_data['age_group'] = age_data['age_group'].astype(str)
-    fig = px.bar(age_data, x='age_group', y='dep_delay',
-                 color='dep_delay', color_continuous_scale='RdYlGn_r',
-                 labels={'dep_delay': 'Avg Dep Delay (min)', 'age_group': 'Plane Age'},
-                 template='plotly_dark')
+@app.callback(Output('g-age-delay','figure'), Input('dd-age-origin','value'))
+def cb_age_delay(origin):
+    d = age_delay if origin == 'ALL' else age_delay[age_delay['origin']==origin]
+    d = d.groupby('age_group')['dep_delay'].mean().reset_index()
+    fig = px.bar(d, x='age_group', y='dep_delay', color='dep_delay',
+                 color_continuous_scale='RdYlGn_r', template='plotly_dark',
+                 labels={'dep_delay':'Avg Dep Delay (min)','age_group':'Plane Age'})
     fig.add_hline(y=0, line_dash='dash', line_color='white')
-    fig.update_layout(margin=dict(t=20), coloraxis_showscale=False)
+    fig.update_layout(coloraxis_showscale=False, margin=dict(t=20))
     return fig
 
-# ── Manufacturer chart ────────────────────────────────────────────────────────
-@app.callback(Output('manufacturer-chart', 'figure'), Input('main-tabs', 'active_tab'))
-def update_manufacturer(_):
-    fp = flights.merge(planes[['tailnum', 'manufacturer_clean']], on='tailnum', how='left')
-    data = (
-        fp.groupby('manufacturer_clean').size()
-        .reset_index(name='flights')
-        .sort_values('flights', ascending=True)
-        .tail(10)
-    )
-    fig = px.bar(data, x='flights', y='manufacturer_clean', orientation='h',
-                 labels={'flights': 'Number of Flights', 'manufacturer_clean': 'Manufacturer'},
-                 color='flights', color_continuous_scale='Blues',
-                 template='plotly_dark')
-    fig.update_layout(margin=dict(t=20), coloraxis_showscale=False)
+@app.callback(Output('g-mfr','figure'), Input('g-mfr','id'))
+def cb_mfr(_):
+    fig = px.bar(mfr_flights, x='flights', y='mfr', orientation='h',
+                 color='flights', color_continuous_scale='Blues', template='plotly_dark',
+                 labels={'flights':'Number of Flights','mfr':'Manufacturer'})
+    fig.update_layout(coloraxis_showscale=False, margin=dict(t=20))
     return fig
 
-# ── Yield curve ───────────────────────────────────────────────────────────────
-@app.callback(Output('yield-curve-chart', 'figure'),
-              Input('yield-date-range', 'start_date'),
-              Input('yield-date-range', 'end_date'))
-def update_yield_curve(start_date, end_date):
+@app.callback(Output('g-yield','figure'),
+              Input('dp-yield','start_date'), Input('dp-yield','end_date'))
+def cb_yield(start_date, end_date):
     try:
         import pandas_datareader.data as web
-        import datetime
-        start = pd.to_datetime(start_date)
-        end   = pd.to_datetime(end_date)
-        gs10  = web.DataReader('GS10',  'fred', start, end)
-        tb3ms = web.DataReader('TB3MS', 'fred', start, end)
-        spread = (gs10.join(tb3ms, how='inner'))
-        spread.columns = ['GS10', 'TB3MS']
-        spread['spread'] = spread['GS10'] - spread['TB3MS']
-        spread = spread.reset_index()
-        spread.columns = ['date', 'GS10', 'TB3MS', 'spread']
+        gs10  = web.DataReader('GS10',  'fred', pd.to_datetime(start_date), pd.to_datetime(end_date))
+        tb3ms = web.DataReader('TB3MS', 'fred', pd.to_datetime(start_date), pd.to_datetime(end_date))
+        df = gs10.join(tb3ms, how='inner')
+        df.columns = ['GS10','TB3MS']
+        df['spread'] = df['GS10'] - df['TB3MS']
+        df = df.reset_index()
+        df.columns = ['date','GS10','TB3MS','spread']
     except Exception:
-        # Fallback: synthetic illustration
-        dates = pd.date_range('1990-01-01', '2024-01-01', freq='MS')
-        np.random.seed(42)
-        spread_vals = np.sin(np.linspace(0, 12, len(dates))) * 2 + np.random.randn(len(dates)) * 0.3
-        spread = pd.DataFrame({'date': dates, 'spread': spread_vals})
-        spread = spread[(spread['date'] >= start_date) & (spread['date'] <= end_date)]
+        dates = pd.date_range(start_date, end_date, freq='MS')
+        df = pd.DataFrame({'date': dates,
+                           'spread': np.sin(np.linspace(0,10,len(dates)))*2})
 
-    recessions = pd.DataFrame({
-        'start': ['1990-07-01', '2001-03-01', '2007-12-01', '2020-02-01'],
-        'end':   ['1991-03-01', '2001-11-01', '2009-06-01', '2020-04-01'],
-    })
+    recessions = [('1990-07-01','1991-03-01'),('2001-03-01','2001-11-01'),
+                  ('2007-12-01','2009-06-01'),('2020-02-01','2020-04-01')]
 
     fig = go.Figure()
+    for rs, re in recessions:
+        if pd.to_datetime(start_date) <= pd.to_datetime(re) and pd.to_datetime(rs) <= pd.to_datetime(end_date):
+            fig.add_vrect(x0=rs, x1=re, fillcolor='grey', opacity=0.2, layer='below', line_width=0)
 
-    # Recession shading
-    for _, rec in recessions.iterrows():
-        rs, re = pd.to_datetime(rec['start']), pd.to_datetime(rec['end'])
-        if pd.to_datetime(start_date) <= re and rs <= pd.to_datetime(end_date):
-            fig.add_vrect(x0=rs, x1=re, fillcolor='grey', opacity=0.2,
-                          layer='below', line_width=0,
-                          annotation_text='Recession', annotation_position='top left',
-                          annotation_font_size=9, annotation_font_color='grey')
-
-    # Spread line
-    colors = ['#ff6b6b' if v < 0 else '#00bcd4' for v in spread['spread']]
-    fig.add_trace(go.Scatter(
-        x=spread['date'], y=spread['spread'],
-        mode='lines', name='10Y - 3M Spread',
-        line=dict(color='#00bcd4', width=1.5)
-    ))
-
-    # Fill negative (inversion)
-    fig.add_trace(go.Scatter(
-        x=spread['date'], y=spread['spread'].clip(upper=0),
-        fill='tozeroy', fillcolor='rgba(255,107,107,0.3)',
-        line=dict(color='rgba(0,0,0,0)'), name='Inversion Zone'
-    ))
-
-    fig.add_hline(y=0, line_dash='dash', line_color='white', opacity=0.7)
-    fig.update_layout(
-        template='plotly_dark',
-        yaxis_title='Spread (percentage points)',
-        xaxis_title='Date',
-        margin=dict(t=20),
-        legend=dict(orientation='h', y=1.05)
-    )
+    fig.add_trace(go.Scatter(x=df['date'], y=df['spread'], mode='lines',
+                             name='10Y-3M Spread', line=dict(color='#00bcd4', width=1.5)))
+    fig.add_trace(go.Scatter(x=df['date'], y=df['spread'].clip(upper=0),
+                             fill='tozeroy', fillcolor='rgba(255,107,107,0.35)',
+                             line=dict(color='rgba(0,0,0,0)'), name='Inversion'))
+    fig.add_hline(y=0, line_dash='dash', line_color='white', opacity=0.6)
+    fig.update_layout(template='plotly_dark', yaxis_title='Spread (%pts)',
+                      margin=dict(t=20), legend=dict(orientation='h', y=1.05))
     return fig
 
-
 # ==============================================================================
-# RUN
-# ==============================================================================
-
 server = app.server
 
 if __name__ == '__main__':
