@@ -5,17 +5,20 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
-from nycflights13 import flights, weather, planes, airlines
+flights = pd.read_csv("https://raw.githubusercontent.com/byuidatascience/data4python4ds/master/data-raw/flights/flights.csv")
+airlines = pd.read_csv("https://raw.githubusercontent.com/byuidatascience/data4python4ds/master/data-raw/airlines/airlines.csv")
+planes = pd.read_csv("https://raw.githubusercontent.com/byuidatascience/data4python4ds/master/data-raw/planes/planes.csv")
+weather = pd.read_csv("https://raw.githubusercontent.com/byuidatascience/data4python4ds/master/data-raw/weather/weather.csv")
 
 # =============================================================================
 # DATA PREPARATION (Maintaining Notebook Logic)
 # =============================================================================
 
 # Load data
-df_flights = flights.copy()
-df_planes = planes.copy()
-df_weather = weather.copy()
-df_airlines = airlines.copy()
+df_flights = flights
+df_planes = planes
+df_weather = weather
+df_airlines = airlines
 
 # 1. Logic: Identify Cancelled Flights (Selection Bias Analysis)
 df_flights['is_cancelled'] = df_flights['dep_time'].isna()
