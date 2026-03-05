@@ -1,8 +1,8 @@
-setuptools
 dash
 dash-bootstrap-components
 plotly
 pandas
 numpy
-nycflights13
+scipy
+pandas-datareader
 gunicorn
